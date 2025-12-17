@@ -43,19 +43,34 @@ class Game:
 
 def payoff_dilemma(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
     """
-    Dilemma archetype (Prisoner's Dilemma style).
-    
-    Players choose cooperation level in [0, 1].
-    Cost c * action, benefit b * partner's action, b > c.
-    Defection (low action) dominates but mutual cooperation is better.
+    ai, aj: Actions in [0, 1] where 0=defect, 1=cooperate
+    params: {'cost': 0.5, 'benefit': 1.0}
     """
     c = params.get('cost', 0.5)
     b = params.get('benefit', 1.0)
     
+    # I pay cost for my cooperation, get benefit from partner's cooperation
     R_i = b * aj - c * ai
     R_j = b * ai - c * aj
     
     return R_i, R_j
+
+# some example situations for this -> 
+
+# # Both cooperate fully
+# R_i, R_j = payoff_dilemma(1.0, 1.0, {'cost': 0.5, 'benefit': 1.0})
+# # R_i = 1.0 × 1.0 - 0.5 × 1.0 = 0.5
+# # R_j = 1.0 × 1.0 - 0.5 × 1.0 = 0.5
+
+# # I defect (0.0), you cooperate (1.0)
+# R_i, R_j = payoff_dilemma(0.0, 1.0, {'cost': 0.5, 'benefit': 1.0})
+# # R_i = 1.0 × 1.0 - 0.5 × 0.0 = 1.0  ← I do better!
+# # R_j = 1.0 × 0.0 - 0.5 × 1.0 = -0.5 ← You do worse!
+
+# # Both defect
+# R_i, R_j = payoff_dilemma(0.0, 0.0, {'cost': 0.5, 'benefit': 1.0})
+# # R_i = 1.0 × 0.0 - 0.5 × 0.0 = 0.0
+# # R_j = 0.0
 
 
 def payoff_assurance(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
@@ -81,6 +96,32 @@ def payoff_assurance(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
     
     return R_i, R_j
 
+# some example situations for assurance -> 
+
+# params = {'threshold': 0.5, 'high': 1.0, 'low': 0.3}
+
+# # Both coordinate HIGH (both hunt stag together)
+# R_i, R_j = payoff_assurance(0.8, 0.8, params)
+# # Both ≥ 0.5, so: R_i = 1.0 × 0.8 × 0.8 = 0.64
+# # R_j = 1.0 × 0.8 × 0.8 = 0.64
+# # BEST OUTCOME: High reward when both commit!
+
+# # Both coordinate LOW (both hunt hare - safe choice)
+# R_i, R_j = payoff_assurance(0.2, 0.2, params)
+# # Both < 0.5, so: R_i = 0.3 × (1-0.2) × (1-0.2) + 0.1 × 0.2 × 0.2
+# #                    = 0.3 × 0.8 × 0.8 + 0.1 × 0.04 = 0.192 + 0.004 = 0.196
+# # SAFE OUTCOME: Decent payoff, no risk
+
+# # MISMATCH: I go high (0.8), you go low (0.2) - DISASTER!
+# R_i, R_j = payoff_assurance(0.8, 0.2, params)
+# # One ≥ threshold but not both, so use low formula:
+# # R_i = 0.3 × (1-0.8) × (1-0.2) + 0.1 × 0.8 × 0.2
+# #     = 0.3 × 0.2 × 0.8 + 0.1 × 0.16 = 0.048 + 0.016 = 0.064
+# # WORST OUTCOME: Coordination failure hurts both!
+# 
+# # The dilemma: Going high is risky - if partner doesn't match, you do worse
+# # than if you both played safe. But if both match high, it's the best outcome.
+
 
 def payoff_bargain(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
     """
@@ -100,6 +141,43 @@ def payoff_bargain(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
         R_j = 0.0
     
     return R_i, R_j
+
+# some example situations for bargain -> 
+
+# params = {'pie_size': 1.0}
+
+# # Compatible demands: Both modest
+# R_i, R_j = payoff_bargain(0.4, 0.5, params)
+# # Sum = 0.4 + 0.5 = 0.9 ≤ 1.0 ✓
+# # R_i = 0.4 (I get what I asked for)
+# # R_j = 0.5 (You get what you asked for)
+# # Both satisfied! Left 0.1 on the table though.
+
+# # Compatible demands: Both greedy but just fit
+# R_i, R_j = payoff_bargain(0.6, 0.4, params)
+# # Sum = 0.6 + 0.4 = 1.0 ≤ 1.0 ✓ (exact fit!)
+# # R_i = 0.6
+# # R_j = 0.4
+# # Efficient! No waste, but unequal split.
+
+# # Incompatible demands: Both too greedy
+# R_i, R_j = payoff_bargain(0.7, 0.8, params)
+# # Sum = 0.7 + 0.8 = 1.5 > 1.0 ✗
+# # R_i = 0.0 (Disagreement! Get nothing!)
+# # R_j = 0.0 (Both lose!)
+# # DISASTER: Greed leads to conflict.
+
+# # Very modest demands: Leave money on table
+# R_i, R_j = payoff_bargain(0.2, 0.3, params)
+# # Sum = 0.2 + 0.3 = 0.5 ≤ 1.0 ✓
+# # R_i = 0.2
+# # R_j = 0.3
+# # Safe but inefficient - left 0.5 unused!
+#
+# # The dilemma: 
+# # - Too modest → waste resources
+# # - Too greedy → risk getting nothing
+# # - Must anticipate partner's demand to find sweet spot
 
 
 def payoff_public_goods(ai: float, aj: float, params: Dict) -> Tuple[float, float]:
@@ -121,6 +199,60 @@ def payoff_public_goods(ai: float, aj: float, params: Dict) -> Tuple[float, floa
     R_j = public_good / 2.0 + (endowment - aj)
     
     return R_i, R_j
+
+# some example situations for public goods -> 
+
+# params = {'multiplier': 1.8, 'endowment': 1.0}
+
+# # Both contribute FULLY (1.0 each)
+# R_i, R_j = payoff_public_goods(1.0, 1.0, params)
+# # Total contribution = 1.0 + 1.0 = 2.0
+# # Public good = 1.8 × 2.0 = 3.6
+# # R_i = 3.6/2 + (1.0 - 1.0) = 1.8 + 0.0 = 1.8
+# # R_j = 3.6/2 + (1.0 - 1.0) = 1.8 + 0.0 = 1.8
+# # BEST COLLECTIVE: Both do great when both contribute!
+
+# # I FREERIDE (0.0), you contribute FULLY (1.0)
+# R_i, R_j = payoff_public_goods(0.0, 1.0, params)
+# # Total contribution = 0.0 + 1.0 = 1.0
+# # Public good = 1.8 × 1.0 = 1.8
+# # R_i = 1.8/2 + (1.0 - 0.0) = 0.9 + 1.0 = 1.9 ← I do BEST!
+# # R_j = 1.8/2 + (1.0 - 1.0) = 0.9 + 0.0 = 0.9 ← You do worse
+# # I win by free-riding! I keep my endowment AND get half the public good.
+
+# # You FREERIDE (0.0), I contribute FULLY (1.0)
+# R_i, R_j = payoff_public_goods(1.0, 0.0, params)
+# # R_i = 0.9 + 0.0 = 0.9 ← I'm the sucker
+# # R_j = 0.9 + 1.0 = 1.9 ← You exploit me
+# # Symmetric to above - contributor gets exploited.
+
+# # Both FREERIDE (0.0 each)
+# R_i, R_j = payoff_public_goods(0.0, 0.0, params)
+# # Total contribution = 0.0 + 0.0 = 0.0
+# # Public good = 1.8 × 0.0 = 0.0
+# # R_i = 0.0/2 + (1.0 - 0.0) = 0.0 + 1.0 = 1.0
+# # R_j = 0.0/2 + (1.0 - 0.0) = 0.0 + 1.0 = 1.0
+# # We both keep our endowment, but no multiplication benefit.
+
+# # Partial contribution (0.5 each)
+# R_i, R_j = payoff_public_goods(0.5, 0.5, params)
+# # Total contribution = 0.5 + 0.5 = 1.0
+# # Public good = 1.8 × 1.0 = 1.8
+# # R_i = 1.8/2 + (1.0 - 0.5) = 0.9 + 0.5 = 1.4
+# # R_j = 1.8/2 + (1.0 - 0.5) = 0.9 + 0.5 = 1.4
+# # Better than no contribution, worse than full mutual contribution.
+#
+# # The dilemma:
+# # Individual incentive: Contribute 0, let partner contribute
+# #   → I get 1.9 (best individual outcome)
+# # Collective optimum: Both contribute 1.0
+# #   → Each gets 1.8 (best mutual outcome)
+# # Mutual defection: Both contribute 0
+# #   → Each gets 1.0 (safe but suboptimal)
+#
+# # This only works as a dilemma if multiplier < n_players
+# # With multiplier=1.8 and n=2, freeriding (1.9) > mutual cooperation (1.8)
+# # so there's individual incentive to defect!
 
 
 # ============================================================================

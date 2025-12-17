@@ -1,9 +1,3 @@
-"""
-Visualization script for the Moral Game Generator (MGG).
-
-Creates heatmaps showing payoffs and fairness functions for each archetype.
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
 from mgg import MoralGameGenerator, Archetype

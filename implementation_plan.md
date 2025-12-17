@@ -1,812 +1,525 @@
-A **step-by-step implementation plan** for TGMI following the guidelines.
+Perfect, this updated Algorithm 1 is concrete enough that we can now design a clean implementation plan around it. I’ll:
 
-I’ll assume Python + NumPy, but the structure is language-agnostic. I’ll organize by the recommended sequence:
+* Map the updated algorithm line-by-line into what you’d code.
+* Spell out the exact components your codebase needs (classes, functions, hyperparams).
+* Then outline how to plug in a **Bayesian Reciprocator (BR)** agent for comparison.
 
-1. Moral Game Generator (MGG)
-2. TGMI agent
-3. Logging
-4. Moran process
-
-For each, I’ll give: data structures, function signatures, and a build-&-test order.
+I’ll use your updated pseudo-code and notation as ground truth. 
 
 ---
 
-## 0. High-level architecture
+## 1. Decode the updated Algorithm 1 into “what we need to implement”
 
-Suggested module layout:
+Here’s a cleaned version of the algorithm in plain math / code-ish notation.
 
-* `mgg.py` – Moral Game Generator (payoff archetypes, fairness functions, game sampling)
-* `tgmi_agent.py` – TGMI agent class + partner-state management
-* `simulation.py` – intragenerational rollouts of pairs in MGG
-* `logging_utils.py` – run logging helpers
-* `moran.py` – evolutionary loop over population
-* `config.py` – hyperparameters (η, λ_dev, α, β, γ, ε_a, ω, etc.)
+### 1.1. Inputs / primitives
 
-Key design principles:
+From the header: 
 
-* Keep **MGG completely independent** of TGMI (it should just know payoffs & fairness functions).
-* TGMI should depend only on: fairness values Fϕ(aᵢ,aⱼ), agents’ moral priors Bᵢ, beliefs B̂ᵢ→ⱼ, and game action spaces.
+* Fairness principles:
+  (F = {\omega_1, \dots, \omega_K}).
+* Payoff function:
+  (R_i(a_i, a_j)) (you might not use it directly in Alg 1, but it’s part of the overall model).
+* Intrinsic moral prior of agent (i):
+  (B_i(\omega)) (a probability distribution over (F)).
 
----
+You also need:
 
-## 1. Implement the Moral Game Generator (MGG)
-
-### 1.1 Core objects and types
-
-Define an enum for payoff archetypes:
-
-```python
-class Archetype(Enum):
-    DILEMMA = 1
-    ASSURANCE = 2
-    BARGAIN = 3
-    PUBLIC_GOODS = 4
-```
-
-Define a `Game` object representing a *single* sampled interaction:
-
-```python
-@dataclass
-class Game:
-    archetype: Archetype
-    action_space_i: np.ndarray  # e.g. 1D array of discrete actions for i
-    action_space_j: np.ndarray  # same for j
-    R_i: np.ndarray             # shape (n_ai, n_aj)
-    R_j: np.ndarray             # shape (n_ai, n_aj)
-    F: Dict[str, np.ndarray]    # e.g. {"max_sum": ..., "equal_split": ..., "rawls": ...}, each (n_ai, n_aj)
-    R_max: float                # max payoff used for normalization
-```
-
-You can later extend to 3-player games; start with 2-player.
-
-### 1.2 Action space design
-
-Paper uses continuous action spaces; for implementation, start with a **discretized grid**:
-
-```python
-action_space = np.linspace(0.0, 1.0, num=21)  # 21 actions from 0 to 1
-```
-
-Use the same grid for both players initially; later you can generalize.
-
-### 1.3 Payoff archetypes (Ri(aᵢ, aⱼ))
-
-From the paper: each game draws a payoff function from Dilemma / Assurance / Bargain / Public-Goods, with payoffs normalized to [0,1].
-
-Implementation plan:
-
-* Create four functions:
-
-```python
-def payoff_dilemma(ai, aj, params) -> Tuple[float, float]:
-    ...
-
-def payoff_assurance(ai, aj, params) -> Tuple[float, float]:
-    ...
-
-def payoff_bargain(ai, aj, params) -> Tuple[float, float]:
-    ...
-
-def payoff_public_goods(ai, aj, params) -> Tuple[float, float]:
-    ...
-```
-
-Each returns `(R_i, R_j)` for scalar actions `ai`, `aj`.
-
-* Wrap them into a factory:
-
-```python
-def sample_payoff_function(archetype: Archetype, rng, config) -> Callable:
-    # sample any needed parameters (e.g., benefit/cost ratios, thresholds)
-    # return a closure payoff(ai, aj) -> (R_i, R_j)
-```
-
-**Where to get exact formulas?**
-The exact parameterizations are in the Supplementary Appendix; the main text only says the archetypes and that `R_i ∈ [0,1]`.
-So in the implementation plan:
-
-* Step 1: stub with simple, textbook-like functions (donation game, stag-hunt, bargaining over a pie, public goods).
-* Step 2: once you’re happy with the TGMI loop, replace stub functions with the exact equations from the supplement.
-
-### 1.4 Fairness functions Fϕ(aᵢ, aⱼ)
-
-From the paper, fairness mappings:
-
-[
-F_{\text{Max-Sum}} = \frac{R_i + R_j}{R_{\max}},\quad
-F_{\text{Equal-Split}} = 1 - \frac{|R_i - R_j|}{R_{\max}},\quad
-F_{\text{Rawls}} = \frac{\min(R_i, R_j)}{R_{\max}}.
-]
-
-Plan:
-
-1. After computing Rᵢ and Rⱼ over the action grid, compute:
-
-   ```python
-   R_max = max(R_i.max(), R_j.max())
-   F_max_sum = (R_i + R_j) / R_max
-   F_equal_split = 1.0 - np.abs(R_i - R_j) / R_max
-   F_rawls = np.minimum(R_i, R_j) / R_max
-   ```
-
-2. Store in the `Game` object as:
-
-   ```python
-   F = {
-       "max_sum": F_max_sum,
-       "equal_split": F_equal_split,
-       "rawls": F_rawls,
-   }
-   ```
-
-These already lie in [0,1] by construction if Rᵢ,Rⱼ ∈ [0,1].
-
-### 1.5 Sampling a game
-
-Implement a `MoralGameGenerator` class:
-
-```python
-class MoralGameGenerator:
-    def __init__(self, archetype_probs, action_grid, rng, config):
-        self.archetype_probs = archetype_probs  # e.g. uniform over 4 archetypes
-        self.action_grid = action_grid
-        self.rng = rng
-        self.config = config
-
-    def sample_game(self) -> Game:
-        # 1. Sample archetype
-        archetype = self.rng.choice(list(Archetype), p=self.archetype_probs)
-
-        # 2. Sample payoff function closure
-        payoff_fn = sample_payoff_function(archetype, self.rng, self.config)
-
-        # 3. Construct payoff matrices
-        A = self.action_grid
-        n = len(A)
-        R_i = np.zeros((n, n))
-        R_j = np.zeros((n, n))
-        for idx_i, ai in enumerate(A):
-            for idx_j, aj in enumerate(A):
-                Ri_ij, Rj_ij = payoff_fn(ai, aj)
-                R_i[idx_i, idx_j] = Ri_ij
-                R_j[idx_i, idx_j] = Rj_ij
-
-        # 4. Normalize payoffs to [0,1]
-        R_min = min(R_i.min(), R_j.min())
-        R_max_raw = max(R_i.max(), R_j.max())
-        # shift & scale to [0,1]
-        R_i = (R_i - R_min) / (R_max_raw - R_min)
-        R_j = (R_j - R_min) / (R_max_raw - R_min)
-        R_max = max(R_i.max(), R_j.max())
-
-        # 5. Compute fairness functions as above
-        F_max_sum = (R_i + R_j) / R_max
-        F_equal_split = 1.0 - np.abs(R_i - R_j) / R_max
-        F_rawls = np.minimum(R_i, R_j) / R_max
-
-        return Game(
-            archetype=archetype,
-            action_space_i=A,
-            action_space_j=A,
-            R_i=R_i,
-            R_j=R_j,
-            F={"max_sum": F_max_sum,
-               "equal_split": F_equal_split,
-               "rawls": F_rawls},
-            R_max=R_max,
-        )
-```
-
-This matches the description: each sampled game specifies a payoff surface and fairness environment; all payoffs and fairness values are rescaled to [0,1].
-
-### 1.6 Moral priors for agents
-
-At *agent creation* (not per game), assign:
-
-[
-B_i = (w_{\text{Max-Sum}}, w_{\text{Equal-Split}}, w_{\text{Rawls}})
-\sim \text{Dirichlet}(1,1,1).
-]
-
-Implementation:
-
-```python
-def sample_moral_prior(rng, num_principles=3):
-    alpha = np.ones(num_principles)
-    return rng.dirichlet(alpha)  # returns np.array of length 3
-```
+* Discrete action spaces (A_i, A_j) (e.g., ({C,D}) or a larger set).
+* Fairness score functions
+  (F_\omega(a_i, a_j) \in [0,1]) for each norm (\omega \in F).
+  (These are the “norm utilities” defined in the Methods.)
 
 ---
 
-### 1.7 Tests for MGG
+### 1.2. Initialization (lines 1–4)
 
-Before touching TGMI:
+1. **Belief over partner’s norms** (\hat B_{i\to j}(\omega)):
 
-1. **Unit tests**
+   [
+   \hat B_{i\to j}^{(0)} \sim \text{Dirichlet}(1,\dots,1) \quad\Rightarrow\quad
+   \mathbb E[\hat B_{i\to j}^{(0)}(\omega)] = \tfrac{1}{|F|}
+   ]
 
-* Sample 100 games; assert:
+2. **Trust and confidence**:
 
-  * `0 ≤ R_i, R_j ≤ 1` and `0 ≤ F[φ] ≤ 1`.
-  * `F["equal_split"]` is highest when `R_i == R_j`.
-  * `F["max_sum"]` is monotonic in `(R_i + R_j)`.
+   [
+   \vartheta_i^{(0)} = \vartheta_0, \quad
+   c_i^{(0)} = 1 - \frac{H(\hat B_{i\to j}^{(0)})}{\log |F|}
+   ]
 
-2. **Sanity plots (optional)**
+   where (H) is Shannon entropy.
 
-* Heatmaps of Rᵢ and each Fϕ for one sampled game per archetype.
+3. **Effective cooperation weight**:
 
-Once that is solid, move on to TGMI.
+   [
+   \varpi_i^{(0)} = \vartheta_i^{(0)} , c_i^{(0)}.
+   ]
+
+4. **Reservation utilities**:
+
+   [
+   d_i^{(0)} = 0,\quad d_j^{(0)} = 0.
+   ]
 
 ---
 
-## 2. Implement the TGMI agent
+### 1.3. Main loop over rounds (t=1,\dots,T) (line 5)
 
-We follow Algorithm 1 from the paper.
+For each round:
 
-### 2.1 Data structures
+#### (a) Trust–confidence–gated moral utilities (lines 6–8)
 
-#### PartnerState
+Loop over all joint actions ((a_i,a_j) \in A_i \times A_j).
 
-Per partner j, agent i keeps:
+1. **Agent i’s own moral utility** (line 7):
 
-```python
-@dataclass
-class PartnerState:
-    B_hat: np.ndarray   # belief over partner's moral norms, shape (|F|,)
-    tau: float          # trust τ_i ∈ [0,1]
-    c: float            # confidence c_i ∈ [0,1]
-    kappa: float        # κ_i = τ_i * c_i
-    d: float            # reservation utility d_i
-```
+   [
+   U_i(a_i, a_j)
+   = \sum_{\omega \in F}
+   \big[(1 - \varpi_i) B_i(\omega) + \varpi_i \hat B_{i\to j}(\omega)\big]
+   , F_\omega(a_i, a_j).
+   ]
 
-#### TGMI_Agent
+   * ((1-\varpi_i)): weight on *own* moral prior.
+   * (\varpi_i): weight on inferred partner norms.
 
-```python
-class TGMI_Agent:
-    def __init__(self, agent_id, moral_prior, hyperparams, rng):
-        self.id = agent_id
-        self.B = moral_prior            # intrinsic moral prior Bi(ϕ)
-        self.hyper = hyperparams        # η, λ_dev, α, β, γ, τ0, ...
-        self.rng = rng
-        self.partners: Dict[int, PartnerState] = {}
-        # for logging
-        self.log = []
-```
+2. **Agent i’s internal model of partner j’s utility** (line 8):
 
-### 2.2 Partner initialization
+   [
+   \hat U^{(i)}*j(a_j, a_i)
+   = \sum*{\omega \in F}
+   \hat B_{i\to j}(\omega) , F_\omega(a_j, a_i).
+   ]
 
-When i first meets j:
+   * Crucial updates reflected here:
 
-```python
-def _init_partner_state(self, partner_id):
-    num_phi = len(self.B)
-    B_hat = self.rng.dirichlet(np.ones(num_phi))  # Dirichlet(1,...,1)
-    H = -np.sum(B_hat * np.log(B_hat + 1e-12))    # Shannon entropy
-    c = 1.0 - H / np.log(num_phi)                 # confidence ∈ [0,1]
-    tau = self.hyper.tau0
-    kappa = tau * c
-    d = 0.0
-    self.partners[partner_id] = PartnerState(B_hat=B_hat, tau=tau, c=c, kappa=kappa, d=d)
-```
+     * This is **(\hat U_j)**, the internal model, not the true (U_j).
+     * It uses **only** (\hat B_{i\to j}), not (B_j), and relies on the CK-ToM symmetry (\hat B_{i\to j} \approx \hat B_{j\to i}). 
 
-### 2.3 Trust–confidence–gated moral utility
+#### (b) Virtual bargaining (VB) step (line 8 block)
 
-From Eq. 2:
-
-[
-U_i(a) = \sum_{\phi\in F}
-\big[(1-\kappa_i)B_i(\phi) + \kappa_i \hat B_{i\to j}(\phi)\big] F_\phi(a)
-]
-
-Implement as:
-
-```python
-def moral_utility(self, partner_id, F_at_a: np.ndarray) -> float:
-    """
-    F_at_a: np.array of length |F| with [F_max_sum(a), F_equal_split(a), F_rawls(a)]
-    """
-    ps = self.partners[partner_id]
-    w = (1.0 - ps.kappa) * self.B + ps.kappa * ps.B_hat
-    return float(np.dot(w, F_at_a))
-```
-
-### 2.4 Virtual bargaining (joint step)
-
-This is easiest to implement **outside** the agent as a function that sees both agents’ states. From Algorithm 1 and Eq. 3:
+Joint VB solution (conceptual coordination):
 
 [
 (a_i^{VB}, a_j^{VB}) = \arg\max_{a_i,a_j}
-\big(U_i(a_i,a_j) - d_i\big)*+^\gamma
-\big(U_j(a_j,a_i) - d_j\big)*+^{1-\gamma}
-]
-with ((x)_+ = \max(x,0)).
+\Big[
+(U_i(a_i,a_j) - d_i)^+
 
-Implementation plan:
+* \rho , (\hat U^{(i)}_j(a_j,a_i) - d_j)^+
+  \Big],
+  ]
 
-```python
-def virtual_bargain(game: Game, agent_i: TGMI_Agent, agent_j: TGMI_Agent,
-                    gamma: float) -> Tuple[int, int, float, float]:
-    """
-    Returns:
-      idx_ai, idx_aj: indices in action_space_i, action_space_j
-      Ui_vb, Uj_vb: utilities at VB joint action
-    """
-    A_i = game.action_space_i
-    A_j = game.action_space_j
-    ps_i = agent_i.partners[agent_j.id]
-    ps_j = agent_j.partners[agent_i.id]
-    best_value = -np.inf
-    best = None
+where:
 
-    for idx_i, ai in enumerate(A_i):
-        for idx_j, aj in enumerate(A_j):
-            # fairness vector at this joint action
-            F_vec = np.array([
-                game.F["max_sum"][idx_i, idx_j],
-                game.F["equal_split"][idx_i, idx_j],
-                game.F["rawls"][idx_i, idx_j],
-            ])
+* ((x)^+ = \max(x,0)),
+* (\rho \in (0,1)) is the bargaining asymmetry weight (“ϱ” in the text). 
 
-            Ui = agent_i.moral_utility(agent_j.id, F_vec)
-            Uj = agent_j.moral_utility(agent_i.id, F_vec)  # note symmetry in Fϕ(a)
+Agent (i) will **intend** to play (a_i^{VB}). The partner’s action might be:
 
-            gain_i = max(Ui - ps_i.d, 0.0)
-            gain_j = max(Uj - ps_j.d, 0.0)
+* literally (a_j^{VB}) (if partner is also TGMI and they coordinate), or
+* something else (e.g., if partner is a BR agent or noisy).
 
-            value = (gain_i ** gamma) * (gain_j ** (1.0 - gamma))
-            if value > best_value:
-                best_value = value
-                best = (idx_i, idx_j, Ui, Uj)
+#### (c) Fairness deviation & trust update (lines 9–12)
 
-    return best  # (idx_ai, idx_aj, Ui_vb, Uj_vb)
-```
-
-This directly implements the Nash-product-style VB step described in the paper.
-
-### 2.5 Action noise εₐ (optional at first)
-
-From the MGG description: each game includes independent action error εₐ.
-
-Implementation:
-
-* After choosing `(idx_ai, idx_aj)` as VB actions, with probability εₐ, replace the action index for each agent independently by a random index.
-
-In early debugging, set εₐ = 0 to keep things deterministic.
-
-### 2.6 Fairness-only utility Uᶠᵢ and deviation
-
-From Algorithm 1:
+9. **Fairness-only utility under own moral prior** (line 9):
 
 [
-U^F_i(a_i, a_j) = \sum_\phi B_i(\phi) F_\phi(a_i, a_j)
+U_i^F(a_i, a_j)
+= \sum_{\omega \in F} B_i(\omega) F_\omega(a_i, a_j).
 ]
 
-Deviations:
+10. **Fairness deviation** (line 10):
 
 [
-d_i^{(t)} = \max_{a_j'} U^F_i(a_i^{VB}, a_j') - U^F_i(a_i^{VB}, a_j^{VB})
+d_i^{(t)} =
+\max_{a_j' \in A_j} U_i^F(a_i^{VB}, a_j') ;-;
+U_i^F(a_i^{VB}, a_j^{VB}).
 ]
 
-Implementation:
+Interpretation: shortfall between:
 
-```python
-def fairness_utility(agent_i: TGMI_Agent, game: Game, idx_ai: int, idx_aj: int) -> float:
-    F_vec = np.array([
-        game.F["max_sum"][idx_ai, idx_aj],
-        game.F["equal_split"][idx_ai, idx_aj],
-        game.F["rawls"][idx_ai, idx_aj],
-    ])
-    return float(np.dot(agent_i.B, F_vec))
+* the *best* fairness outcome i could get if j behaved optimally (from i’s fairness perspective), and
+* the fairness outcome predicted by VB (or realized, depending on how you plug in actual vs VB actions). 
 
-def fairness_deviation(agent_i: TGMI_Agent, agent_j: TGMI_Agent,
-                       game: Game, idx_ai_vb: int, idx_aj_vb: int) -> Tuple[float, float]:
-    """Returns (d_i_t, U_F_i_vb)"""
-    A_j = game.action_space_j
-    B_i = agent_i.B
-
-    # fairness under realized (VB) joint action
-    UF_vb = fairness_utility(agent_i, game, idx_ai_vb, idx_aj_vb)
-
-    # find best possible fairness i could have gotten from j
-    best_UF = -np.inf
-    for idx_aj_prime, aj_prime in enumerate(A_j):
-        UF_candidate = fairness_utility(agent_i, game, idx_ai_vb, idx_aj_prime)
-        if UF_candidate > best_UF:
-            best_UF = UF_candidate
-
-    d_i_t = best_UF - UF_vb  # fairness shortfall caused by j
-    return d_i_t, UF_vb
-```
-
-This matches the description: `d_i` measures fairness shortfall caused by the partner’s action given i’s VB action.
-
-### 2.7 Trust update
-
-From the text: trust evolves via a leaky integrator of compliance.
-
-1. Compliance:
+11. **Compliance signal** (line 11):
 
 [
-s_i^{(t)} = \exp(-\lambda_{\text{dev}} d_i^{(t)})
+s_i^{(t)} = \exp(-\xi_{\text{dev}} , d_i^{(t)}),
 ]
 
-2. Trust update:
+where (\xi_{\text{dev}}) (your “ς_dev”) controls sensitivity to fairness deviations.
+
+12. **Trust update** (line 12):
 
 [
-\tau_i^{(t+1)} = (1-\eta)\tau_i^{(t)} + \eta s_i^{(t)}
-]
+\vartheta_i^{(t+1)}
+= (1 - \phi) , \vartheta_i^{(t)}
 
-Implementation:
+* \phi , s_i^{(t)},
+  ]
 
-```python
-def update_trust(agent_i: TGMI_Agent, partner_id: int, d_i_t: float):
-    ps = agent_i.partners[partner_id]
-    lam = agent_i.hyper.lambda_dev
-    eta = agent_i.hyper.eta
+with (\phi \in (0,1)) a trust learning rate.
 
-    s_i_t = np.exp(-lam * d_i_t)
-    ps.tau = (1.0 - eta) * ps.tau + eta * s_i_t
-```
+#### (d) Belief update & re-gating (lines 13–17)
 
-Clamp to [0,1] if needed for numerical stability.
-
-### 2.8 CK-ToM belief update
-
-From Eq. 4:
+13. **Belief update for each norm (\omega)** (line 13):
 
 [
-\hat B_{i\to j}^{(t+1)}(\phi) \propto
-\hat B_{i\to j}^{(t)}(\phi)
-\left[\exp(\beta F_\phi(a^{(t)}))\right]^{1-\alpha\tau_i^{(t)}}
-\left[B_i(\phi)\right]^{\alpha\tau_i^{(t)}}
+\tilde B_{i\to j}^{(t+1)}(\omega)
+=================================
+
+\hat B_{i\to j}^{(t)}(\omega)
+\cdot
+\exp\big(\beta , \vartheta_i^{(t)} F_\omega(a_i^{VB}, a_j^{VB})\big)
+\cdot
+\big(B_i(\omega)\big)^{,1 - \vartheta_i^{(t)} \varpi_i^{(t)}}
 ]
 
-Implementation:
+* First factor: previous belief.
+* Second factor: fairness evidence term, scaled by trust ((\vartheta_i^t)) and sensitivity (\beta).
+* Third factor: **self-anchoring** on own prior (B_i(\omega)) with exponent (1 - \vartheta_i \varpi_i).
+  This is where the “weights being swapped” shows up: trust & cooperation weight control the balance between new fairness evidence vs prior anchoring. 
 
-```python
-def update_belief(agent_i: TGMI_Agent, partner_id: int,
-                  game: Game, idx_ai_vb: int, idx_aj_vb: int):
-    ps = agent_i.partners[partner_id]
-    beta = agent_i.hyper.beta
-    alpha = agent_i.hyper.alpha
+(Exact constants (\beta), exponent details you’ll treat as hyperparams following the text.)
 
-    F_vec = np.array([
-        game.F["max_sum"][idx_ai_vb, idx_aj_vb],
-        game.F["equal_split"][idx_ai_vb, idx_aj_vb],
-        game.F["rawls"][idx_ai_vb, idx_aj_vb],
-    ])
-
-    old_B_hat = ps.B_hat
-    tau = ps.tau
-
-    # exponent for fairness evidence
-    w_evidence = 1.0 - alpha * tau
-    # exponent for self-anchoring
-    w_prior = alpha * tau
-
-    unnorm = old_B_hat * np.exp(beta * F_vec) ** w_evidence * (agent_i.B ** w_prior)
-    new_B_hat = unnorm / (unnorm.sum() + 1e-12)
-
-    ps.B_hat = new_B_hat
-```
-
-This matches the CK-ToM update in the paper: high trust ⇒ lean more on fairness evidence; low trust ⇒ revert toward self prior.
-
-### 2.9 Confidence and κ update
-
-From the text:
+14. **Normalize** (line 14):
 
 [
-c_i^{(t+1)} = 1 - \frac{H(\hat B_{i\to j}^{(t+1)})}{\log |F|},\quad
-\kappa_i^{(t+1)} = \tau_i^{(t+1)} c_i^{(t+1)}
+\hat B_{i\to j}^{(t+1)}(\omega)
+= \frac{\tilde B_{i\to j}^{(t+1)}(\omega)}
+{\sum_{\omega' \in F} \tilde B_{i\to j}^{(t+1)}(\omega')}.
 ]
 
-Implementation:
-
-```python
-def update_confidence_and_kappa(agent_i: TGMI_Agent, partner_id: int):
-    ps = agent_i.partners[partner_id]
-    B_hat = ps.B_hat
-    num_phi = len(B_hat)
-
-    H = -np.sum(B_hat * np.log(B_hat + 1e-12))
-    ps.c = 1.0 - H / np.log(num_phi)
-    ps.kappa = ps.tau * ps.c
-```
-
-### 2.10 Reservation utility update
-
-From Algorithm 1: reservation utility is updated from fairness-only utility at VB joint action.
+15. **Update confidence** (line 15):
 
 [
-d_i^{(t+1)} = U^F_i(a_i^{VB}, a_j^{VB})
+c_i^{(t+1)}
+= 1 - \frac{H\big(\hat B_{i\to j}^{(t+1)}\big)}{\log |F|}.
 ]
 
-Implementation:
+16. **Update cooperation weight** (line 16):
 
-```python
-def update_reservation_utility(agent_i: TGMI_Agent, partner_id: int,
-                               UF_i_vb: float):
-    ps = agent_i.partners[partner_id]
-    ps.d = UF_i_vb
-```
+[
+\varpi_i^{(t+1)}
+= \vartheta_i^{(t+1)} , c_i^{(t+1)}.
+]
 
-### 2.11 One round of interaction between two TGMI agents
+17. **Update reservation utility** (line 17):
 
-Glue all the above into a `step` function:
-
-```python
-def tgmi_round(game: Game, agent_i: TGMI_Agent, agent_j: TGMI_Agent,
-               hyperparams):
-    # 1. Ensure partner states exist
-    if agent_j.id not in agent_i.partners:
-        agent_i._init_partner_state(agent_j.id)
-    if agent_i.id not in agent_j.partners:
-        agent_j._init_partner_state(agent_i.id)
-
-    # 2. Virtual bargaining joint action
-    idx_ai_vb, idx_aj_vb, Ui_vb, Uj_vb = virtual_bargain(game, agent_i, agent_j, hyperparams.gamma)
-
-    # 3. (Optional) Apply action noise ε_a to get realized actions
-    idx_ai_real, idx_aj_real = maybe_apply_action_noise(idx_ai_vb, idx_aj_vb, game, hyperparams.epsilon_a)
-
-    # 4. Get realized payoffs
-    Ri = game.R_i[idx_ai_real, idx_aj_real]
-    Rj = game.R_j[idx_ai_real, idx_aj_real]
-
-    # 5. Fairness utilities and deviations
-    d_i_t, UF_i_vb = fairness_deviation(agent_i, agent_j, game, idx_ai_vb, idx_aj_vb)
-    d_j_t, UF_j_vb = fairness_deviation(agent_j, agent_i, game, idx_aj_vb, idx_ai_vb)
-
-    # 6. Update trust
-    update_trust(agent_i, agent_j.id, d_i_t)
-    update_trust(agent_j, agent_i.id, d_j_t)
-
-    # 7. Update beliefs
-    update_belief(agent_i, agent_j.id, game, idx_ai_vb, idx_aj_vb)
-    update_belief(agent_j, agent_i.id, game, idx_aj_vb, idx_ai_vb)
-
-    # 8. Update confidence & κ
-    update_confidence_and_kappa(agent_i, agent_j.id)
-    update_confidence_and_kappa(agent_j, agent_i.id)
-
-    # 9. Update reservation utilities
-    update_reservation_utility(agent_i, agent_j.id, UF_i_vb)
-    update_reservation_utility(agent_j, agent_i.id, UF_j_vb)
-
-    # 10. Logging (next section)
-    log_round(agent_i, agent_j, game, ...)  # we'll define below
-
-    return Ri, Rj, UF_i_vb, UF_j_vb
-```
-
-At this point you have a working TGMI loop as described in Algorithm 1.
+[
+d_i^{(t+1)} = U_i^F(a_i^{VB}, a_j^{VB}).
+]
 
 ---
 
-## 3. Logging
+## 2. Concrete implementation plan (what to actually code)
 
-From the Methods: they log, per iteration:
+Think in terms of **three modules**:
 
-{τᵢᵗ, cᵢᵗ, κᵢᵗ, dᵢᵗ, Uᵢ(aᵛᵇ), Uᶠᵢ(aᵛᵇ), Rᵢ(aᵛᵇ), B̂ᵢ→ⱼᵗ}.
+1. **Fairness & games**
+2. **TGMI agent implementation**
+3. **Experiment harness + BR comparison**
 
-Implement:
+### 2.1. Module 1 – Fairness principles & game environment
+
+**(a) Represent fairness principles**
+
+In Python pseudocode:
 
 ```python
-def log_round(agent_i: TGMI_Agent, agent_j: TGMI_Agent, game: Game,
-              t: int,
-              idx_ai_vb: int, idx_aj_vb: int,
-              Ri: float, Rj: float,
-              UF_i_vb: float, UF_j_vb: float,
-              Ui_vb: float, Uj_vb: float,
-              d_i_t: float, d_j_t: float):
-    ps_i = agent_i.partners[agent_j.id]
-    ps_j = agent_j.partners[agent_i.id]
+from enum import Enum
+import numpy as np
 
-    agent_i.log.append({
-        "round": t,
-        "partner": agent_j.id,
-        "tau": ps_i.tau,
-        "c": ps_i.c,
-        "kappa": ps_i.kappa,
-        "d": ps_i.d,
-        "Ri": Ri,
-        "UF": UF_i_vb,
-        "U": Ui_vb,
-        "d_t": d_i_t,
-        "B_hat": ps_i.B_hat.copy(),
-        "archetype": game.archetype.name,
-        "ai_idx": idx_ai_vb,
-        "aj_idx": idx_aj_vb,
-    })
+class FairnessPrinciple(Enum):
+    MAX_SUM = 0
+    EQUAL_SPLIT = 1
+    RAWLS = 2
+    # add more if needed
 
-    agent_j.log.append({
-        "round": t,
-        "partner": agent_i.id,
-        "tau": ps_j.tau,
-        "c": ps_j.c,
-        "kappa": ps_j.kappa,
-        "d": ps_j.d,
-        "Rj": Rj,
-        "UF": UF_j_vb,
-        "U": Uj_vb,
-        "d_t": d_j_t,
-        "B_hat": ps_j.B_hat.copy(),
-        "archetype": game.archetype.name,
-        "ai_idx": idx_aj_vb,
-        "aj_idx": idx_ai_vb,
-    })
+F = list(FairnessPrinciple)
+K = len(F)
 ```
 
-Later you can dump `agent.log` to pandas DataFrame for analysis.
+**(b) Implement F_ω(a_i, a_j)**
 
-**Sanity checks**:
+You’ll need a function:
 
-* Plot τ over time for different partner types (fair vs selfish). Should look like Fig. 3A: trust rises with fair partner, decays with exploitative one.
-* Plot entropy of B̂ over time → confidence increasing.
+```python
+def fairness_score(phi, payoff_i, payoff_j):
+    if phi == FairnessPrinciple.MAX_SUM:
+        total = payoff_i + payoff_j
+        # Normalize appropriately, e.g., min–max over all joint actions
+        return normalize_total(total)
+    elif phi == FairnessPrinciple.EQUAL_SPLIT:
+        diff = abs(payoff_i - payoff_j)
+        return 1.0 - normalize_diff(diff)
+    elif phi == FairnessPrinciple.RAWLS:
+        m = min(payoff_i, payoff_j)
+        return normalize_min(m)
+```
+
+Under the hood, you’ll precompute:
+
+* All joint payoffs (R_i(a_i,a_j), R_j(a_i,a_j)),
+* Then F_ω(a_i,a_j) for each ω and joint action and cache them for speed.
+
+**(c) Game environment wrapper**
+
+A simple `Game` class:
+
+```python
+class RepeatedGame:
+    def __init__(self, payoff_matrix_i, payoff_matrix_j, actions_i, actions_j, fairness_table):
+        self.R_i = payoff_matrix_i   # shape [n_ai, n_aj]
+        self.R_j = payoff_matrix_j   # shape [n_ai, n_aj]
+        self.actions_i = actions_i
+        self.actions_j = actions_j
+        self.F = fairness_table      # shape [K, n_ai, n_aj]
+```
+
+You can sample many games if you later want to reproduce the Moral Game Generator.
 
 ---
 
-## 4. Moran evolutionary process
+### 2.2. Module 2 – TGMI agent
 
-Once MGG + TGMI are stable, wrap them in a population-level process. Follow the paper’s Moran setup.
+Design a `TGMI_Agent` class whose internal state mirrors Algorithm 1 exactly.
 
-### 4.1 Represent population
-
-```python
-class Population:
-    def __init__(self, agents: List[BaseAgent], types: List[str]):
-        self.agents = agents    # list of TGMI, Selfish, etc.
-        self.types = types      # parallel list of type labels
-```
-
-You’ll have multiple agent classes:
-
-* `TGMI_Agent` (you already built)
-* `SelfishAgent`, `AltruisticAgent`, `TFTAgent`, `WSLSAgent`, etc., with simple policies.
-
-### 4.2 Intragenerational rollout
-
-Per generation:
+**State variables:**
 
 ```python
-def play_generation(pop: Population, mgg: MoralGameGenerator, T: int,
-                    omega: float, rng) -> Dict[int, Dict[str, float]]:
-    """
-    Returns per-agent stats {
-      agent_id: {"R_total": ..., "UF_total": ..., "Phi": ...}
-    }
-    """
-    # initialize per-agent accumulators
-    stats = {agent.id: {"R_total": 0.0, "UF_total": 0.0} for agent in pop.agents}
-
-    for t in range(T):
-        # choose pairs (i,j); simplest: random pairing
-        pairs = sample_pairs(pop.agents, rng)
-
-        for (agent_i, agent_j) in pairs:
-            game = mgg.sample_game()
-
-            if isinstance(agent_i, TGMI_Agent) and isinstance(agent_j, TGMI_Agent):
-                Ri, Rj, UF_i, UF_j = tgmi_round(game, agent_i, agent_j, agent_i.hyper)
-            else:
-                # handle mixed interactions: TGMI vs baseline, baseline vs baseline
-                Ri, Rj, UF_i, UF_j = play_round_mixed(game, agent_i, agent_j, ...)
-
-            stats[agent_i.id]["R_total"] += Ri
-            stats[agent_i.id]["UF_total"] += UF_i
-            stats[agent_j.id]["R_total"] += Rj
-            stats[agent_j.id]["UF_total"] += UF_j
-
-    # compute Φ_i for each agent (fairness-weighted return):contentReference[oaicite:27]{index=27}
-    for agent in pop.agents:
-        R_avg = stats[agent.id]["R_total"] / T
-        UF_avg = stats[agent.id]["UF_total"] / T
-        Phi = (1.0 - omega) * R_avg + omega * UF_avg
-        stats[agent.id]["Phi"] = Phi
-
-    return stats
+class TGMI_Agent:
+    def __init__(self, B_i, F, n_actions_i, n_actions_j,
+                 theta0=0.5, phi=0.1, beta=1.0, xi_dev=1.0):
+        self.F = F                     # list of fairness principles
+        self.B_i = np.array(B_i)       # intrinsic moral prior over F, shape [K]
+        
+        # 1. Belief over partner's norms
+        self.B_hat = np.random.dirichlet(np.ones(len(F)))  # B̂_{i→j}
+        
+        # 2. Trust and confidence
+        self.theta = theta0            # ϑ_i
+        self.c = 1.0 - entropy(self.B_hat) / np.log(len(F))
+        
+        # 3. Effective cooperation weight
+        self.varpi = self.theta * self.c   # ϖ_i
+        
+        # 4. Reservation utilities
+        self.d_i = 0.0
+        self.d_j = 0.0                 # use fixed or symmetrical update
+        
+        # Params
+        self.phi = phi                 # trust update step
+        self.beta = beta               # fairness evidence strength
+        self.xi_dev = xi_dev           # dev sensitivity
+        self.n_actions_i = n_actions_i
+        self.n_actions_j = n_actions_j
 ```
 
-### 4.3 Expected returns per type and selection
+**Helper functions:**
 
-From Methods: they average over S replicates to estimate Φ̅ₖ(n) and use a softmax with selection strength s.
+* `entropy(p)`: Shannon entropy.
+* `compute_U_i(F_table)`: compute own moral utility per joint action.
+* `compute_Uj_hat(F_table)`: compute internal model of partner’s utility.
+* `virtual_bargain(U_i, Uj_hat)`: choose `(a_i_VB, a_j_VB)` via argmax.
+* `update_trust_and_beliefs(...)`: implement lines 9–17.
 
-Implementation:
+**Step function for one round:**
 
 ```python
-def estimate_returns_by_type(pop, mgg, T, omega, S, rng):
-    # collect Φ for each type
-    type_to_phis = defaultdict(list)
-    for s in range(S):
-        # you may need to deep-copy the population, or reset each agent’s internal state
-        stats = play_generation(pop, mgg, T, omega, rng)
-        for agent, t_label in zip(pop.agents, pop.types):
-            type_to_phis[t_label].append(stats[agent.id]["Phi"])
+def select_action(self, game):
+    # game.F has shape [K, n_ai, n_aj]
 
-    Phi_bar = {t: np.mean(vals) for t, vals in type_to_phis.items()}
-    return Phi_bar
+    # 1. Compute trust–confidence–gated utilities U_i and U_j_hat
+    K, n_ai, n_aj = game.F.shape
+    U_i = np.zeros((n_ai, n_aj))
+    Uj_hat = np.zeros((n_aj, n_ai))   # note the swapped arguments
+    
+    for a_i in range(n_ai):
+        for a_j in range(n_aj):
+            # fairness scores vector over norms
+            F_vec = game.F[:, a_i, a_j]      # shape [K]
+
+            mixture_i = (1 - self.varpi) * self.B_i + self.varpi * self.B_hat
+            U_i[a_i, a_j] = np.dot(mixture_i, F_vec)
+
+            # internal partner utility; note order (a_j, a_i)
+            F_vec_partner = game.F[:, a_j, a_i]
+            Uj_hat[a_j, a_i] = np.dot(self.B_hat, F_vec_partner)
+    
+    # 2. Virtual bargaining argmax
+    a_i_VB, a_j_VB = self.virtual_bargain(U_i, Uj_hat)
+
+    # In a symmetric setup, agent i would *intend* to play a_i_VB:
+    return a_i_VB, (a_i_VB, a_j_VB, U_i, Uj_hat)
 ```
 
-Then selection probabilities:
-
-[
-\pi_k(n) = \frac{\exp(s \bar{\Phi}_k(n))}{\sum_m \exp(s \bar{\Phi}_m(n))}.
-]
+**Virtual bargaining implementation:**
 
 ```python
-def selection_probabilities(Phi_bar, selection_strength_s):
-    types = list(Phi_bar.keys())
-    phis = np.array([Phi_bar[t] for t in types])
-    logits = selection_strength_s * phis
-    probs = np.exp(logits - logits.max())
-    probs = probs / probs.sum()
-    return dict(zip(types, probs))
+def virtual_bargain(self, U_i, Uj_hat, rho=0.5):
+    best_val = -np.inf
+    best_pair = (0, 0)
+    n_ai, n_aj = U_i.shape
+
+    for a_i in range(n_ai):
+        for a_j in range(n_aj):
+            val_i = max(U_i[a_i, a_j] - self.d_i, 0.0)
+            val_j = max(Uj_hat[a_j, a_i] - self.d_j, 0.0)
+            objective = val_i + rho * val_j
+            if objective > best_val:
+                best_val = objective
+                best_pair = (a_i, a_j)
+
+    return best_pair
 ```
 
-### 4.4 Moran update
-
-They define a Moran process over population compositions n with mutation μ.
-
-For implementation simplicity, you can do:
+**After environment returns partner’s action** (if you differentiate between VB-intended and actual):
 
 ```python
-def moran_step(pop: Population, pi_type: Dict[str, float], rng, mu: float):
-    """
-    One Moran update:
-    - pick a random learner (to be replaced)
-    - pick type to copy according to pi_type
-    - with prob mu, mutate to a random type instead of copying
-    - rebuild the population object
-    """
-    # 1. Choose learner index
-    learner_idx = rng.integers(len(pop.agents))
+def update_after_round(self, game, a_i_VB, a_j_real, U_i, Uj_hat):
+    # 9. Fairness-only utility UF_i
+    n_ai, n_aj = U_i.shape
+    UF = np.zeros((n_ai, n_aj))
+    for a_i in range(n_ai):
+        for a_j in range(n_aj):
+            # B_i . F_ω(a_i,a_j)
+            F_vec = game.F[:, a_i, a_j]
+            UF[a_i, a_j] = np.dot(self.B_i, F_vec)
+    
+    # 10. Fairness deviation
+    # ideal fairness: best over j’s actions holding a_i_VB fixed
+    best_over_j = UF[a_i_VB, :].max()
+    realized = UF[a_i_VB, a_j_real]    # or a_j_VB if you stick to the algorithm literally
+    d_dev = best_over_j - realized     # d_i^{(t)}
 
-    # 2. Choose type to copy or mutate
-    if rng.random() < mu:
-        new_type = rng.choice(list(pi_type.keys()))
-    else:
-        types = list(pi_type.keys())
-        probs = np.array([pi_type[t] for t in types])
-        new_type = rng.choice(types, p=probs)
+    # 11. Compliance
+    s_t = np.exp(-self.xi_dev * d_dev)
 
-    # 3. Replace learner with new agent of type new_type (re-initialize its moral prior etc.)
-    pop.types[learner_idx] = new_type
-    pop.agents[learner_idx] = make_new_agent_of_type(new_type, rng)
+    # 12. Trust update
+    self.theta = (1 - self.phi) * self.theta + self.phi * s_t
+
+    # 13. Belief update over norms
+    # fairness evidence at VB outcome (you can also use actual outcome)
+    F_vb = game.F[:, a_i_VB, a_j_real]  # vector over ω
+
+    B_tilde = np.zeros_like(self.B_hat)
+    for idx, omega in enumerate(self.F):
+        evid = np.exp(self.beta * self.theta * F_vb[idx])
+        prior_anchor = self.B_i[idx] ** (1 - self.theta * self.varpi)
+        B_tilde[idx] = self.B_hat[idx] * evid * prior_anchor
+
+    # 14. Normalize
+    self.B_hat = B_tilde / B_tilde.sum()
+
+    # 15. Update confidence
+    self.c = 1.0 - entropy(self.B_hat) / np.log(len(self.F))
+
+    # 16. Update cooperation weight
+    self.varpi = self.theta * self.c
+
+    # 17. Update reservation utility
+    self.d_i = UF[a_i_VB, a_j_real]
 ```
 
-Then run this for many generations and track frequency of each type.
-
-If you want the *exact* stationary distribution x*, you’d need to build the full transition matrix over compositions and compute its dominant left eigenvector as described in the paper—but for a first implementation, long-run Monte Carlo is fine.
+You can tweak whether you use VB outcome `(a_i_VB,a_j_VB)` or actual outcome `(a_i_real,a_j_real)` in steps 10, 13, and 17; the algorithm text uses VB forms, but for realistic play you’ll usually plug in actual actions.
 
 ---
 
-## 5. Concrete build order (checklist)
+### 2.3. Module 3 – Experiment harness & BR comparison
 
-**Phase 1 – MGG**
+Now to your question: **“should we compare this agent with the BR agent, and if yes, how?”**
+Yes, and this is the natural place to slot that in.
 
-* [ ] Implement payoff archetype functions (even if as placeholders).
-* [ ] Implement `MoralGameGenerator.sample_game`.
-* [ ] Write tests for payoff and fairness ranges.
-* [ ] Visualize 1–2 sampled games per archetype.
+#### (a) Implement BR agent from the earlier paper
 
-**Phase 2 – TGMI intragenerational loop**
+A `BR_Agent` roughly needs: 
 
-* [ ] Implement `TGMI_Agent` and `PartnerState`.
-* [ ] Implement moral utility, fairness-only utility.
-* [ ] Implement VB (`virtual_bargain`).
-* [ ] Implement fairness deviation + trust update.
-* [ ] Implement belief update + confidence + κ update.
-* [ ] Write a 2-agent script that runs T=30 rounds with fixed priors and prints τ, B̂ evolution.
+* A set of **types** (Selfish, BR, Cooperative, etc.).
+* A belief vector over partner’s type.
+* A **type-specific utility** function (e.g. linear combination of payoffs).
+* A Bayesian update rule for the belief over types given observed behavior.
+* A best-response or virtual-bargaining-like policy based on its expected utilities.
 
-**Phase 3 – Logging and debugging**
+You can:
 
-* [ ] Add logging of τ, c, κ, d, U, Uᶠ, R, B̂ each round.
-* [ ] Inspect logs / plots: trust should go up with fair partner, down with selfish.
-* [ ] Introduce action noise εₐ and check robustness.
+* Keep the exact equations from the BR paper for consistency.
+* Wrap it in a similar interface: `choose_action(game)` and `update_after_round(...)`.
 
-**Phase 4 – Baselines and Moran**
+#### (b) Scenarios to run
 
-* [ ] Implement simple baseline agents (Selfish, Altruistic, TFT, WSLS, etc.).
-* [ ] Implement `play_generation` and `estimate_returns_by_type`.
-* [ ] Implement Moran step and run many generations, track type frequencies.
-* [ ] Experiment with ω=0 (payoff-only selection) vs ω>0 (fairness-weighted).
+For each game (or distribution of games):
+
+1. **Homogeneous populations**:
+
+   * TGMI vs TGMI,
+   * BR vs BR.
+
+2. **Cross-type matchups**:
+
+   * TGMI vs BR,
+   * TGMI vs Selfish, AllD, ZD-Extort, etc.
+
+3. **Moral heterogeneity**:
+
+   * Draw agent moral priors (B_i) from different regions of the simplex (utilitarian-heavy vs Rawls-heavy vs equality-heavy).
+   * Run many matches and watch:
+
+     * trust trajectories (\vartheta_i(t)),
+     * cooperation frequencies,
+     * fairness scores and payoff distributions.
+
+#### (c) Metrics to log
+
+For each pair of agents and game distribution:
+
+* **Cooperation rate**: fraction of rounds with “cooperative” actions (however you define it per game).
+* **Average payoffs**: (\mathbb E[R_i + R_j]) and distribution across agents.
+* **Fairness scores**: (\mathbb E[F_\omega(a)]) for key norms.
+* **Trust & belief dynamics**:
+
+  * trajectory of (\vartheta_i(t)),
+  * entropy of (\hat B_{i\to j}(t)),
+  * evolution of (\varpi_i(t)).
+
+You’d expect:
+
+* Under **shared or mildly different moral priors**, both BR and TGMI can sustain cooperation.
+* Under **strong moral heterogeneity**, BR tends to misclassify “morally different but fair” behavior as defection, tanking cooperation; TGMI uses the norm-space beliefs (\hat B_{i\to j}) + trust gate to preserve cooperation more often.
+
+That comparison directly probes the **value of TGMI’s CK-ToM over moral norms** vs BR’s simpler utility-matching.
+
+---
+
+## 3. What you should expect to *observe* when you run this
+
+If the code matches Algorithm 1:
+
+* Against **fair, compatible partners**:
+
+  * (\vartheta_i) will drift upwards toward 1.
+  * Entropy of (\hat B_{i\to j}) will decrease; (c_i) will rise.
+  * (\varpi_i = \vartheta_i c_i) becomes large → actions more strongly reflect shared moral reasoning.
+  * Joint outcomes will cluster on fairness-high, payoff-decent actions.
+
+* Against **exploitative or misaligned partners**:
+
+  * Fairness deviation (d_i^{(t)}) will be large → (s_i^{(t)}) small.
+  * Trust (\vartheta_i) will decrease.
+  * Belief updates may remain high-entropy → (c_i) low.
+  * (\varpi_i) stays small → fallback to own prior, limiting exploitation.
+
+* In **noisy environments**:
+
+  * (\vartheta_i) may fluctuate but stay moderate if the partner is usually fair.
+  * Beliefs will adjust gradually, reflecting a stable but not fully confident moral model.
+
+These dynamics are exactly what the paper claims mathematically and in the simulation section, so if your curves look qualitatively similar, you’re on the right track.
+
+---
+
+If you want next, we can:
+
+* Tighten this into a **minimal runnable prototype** (with concrete fairness functions and a tiny 2×2 game),
+* Or sketch the BR agent’s update and action-selection loop so you can slot it directly into the same experiment harness.
