@@ -9,7 +9,7 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 _parent_dir = os.path.dirname(_current_dir)
 sys.path.insert(0, _parent_dir)
 
-from mgg.generator import Game, MoralGameGenerator, compute_fairness_functions
+from MGG.generator import Game, MoralGameGenerator, compute_fairness_functions
 
 
 class FairnessPrinciple(Enum):
