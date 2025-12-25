@@ -1,13 +1,20 @@
 """
-Figure 3B: Steady-state abundance of TGMI as a function of game length T
-=========================================================================
+Figure 3C: Steady-state abundance of TGMI as a function of action error ε_a
+============================================================================
 
-OPTIMIZED VERSION:
-- Uses 4 strategy types instead of 7 for faster computation
-- Monte Carlo Moran process (much faster than exact transition matrix)
-- Properly tuned so TGMI benefits from longer games
+Tests TGMI robustness to noisy behavior.
 
-Strategy types: TGMI, TFT, AllC, AllD
+Key insight:
+- With probability ε_a, an agent's chosen action is replaced by a random action
+- TGMI should be robust because trust updates depend on fairness deviation, not single defections
+- Reciprocity strategies (TFT) are famously brittle under noise
+
+Fixed parameters:
+- Game length T = 20
+- Population size N = 10
+- No perception noise (ε_p = 0)
+
+Sweep: ε_a ∈ {0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4}
 """
 
 import numpy as np
@@ -30,7 +37,7 @@ from MGG.generator import MoralGameGenerator, Game
 
 
 # =============================================================================
-# Simplified Strategy Implementations
+# Strategy Implementations
 # =============================================================================
 
 class AllC:
@@ -45,7 +52,7 @@ class AllC:
     
     def select_action(self, game: Game, history=None) -> int:
         n = len(game.action_space_j)
-        action = n - 1
+        action = n - 1  # Cooperate = max action
         if self.rng.random() < self.epsilon:
             return self.rng.integers(0, n)
         return action
@@ -65,7 +72,7 @@ class AllD:
         n = len(game.action_space_j)
         if self.rng.random() < self.epsilon:
             return self.rng.integers(0, n)
-        return 0
+        return 0  # Defect = min action
 
 
 class TFT:
@@ -137,7 +144,7 @@ class TGMIStrategy:
         )
 
 
-# Strategy types for the simulation (reduced for speed)
+# Strategy types for the simulation
 STRATEGY_TYPES = ['TGMI', 'TFT', 'AllC', 'AllD']
 
 
@@ -231,7 +238,7 @@ def compute_payoff_matrix(
     n_samples: int = 20,
     epsilon: float = 0.05,
     rng=None,
-    games: List[Game] = None,  # Pre-sampled games for consistency
+    games: List[Game] = None,
 ) -> np.ndarray:
     """Compute expected payoff matrix."""
     if rng is None:
@@ -240,7 +247,7 @@ def compute_payoff_matrix(
     n_types = len(strategy_types)
     payoffs = np.zeros((n_types, n_types))
     
-    # Use pre-sampled games if provided, otherwise sample new ones
+    # Use pre-sampled games if provided
     if games is None:
         games = [mgg.sample_game() for _ in range(n_samples)]
     
@@ -258,7 +265,7 @@ def compute_payoff_matrix(
 
 
 # =============================================================================
-# Monte Carlo Moran Process (much faster than exact)
+# Monte Carlo Moran Process
 # =============================================================================
 
 def run_moran_monte_carlo(
@@ -273,131 +280,134 @@ def run_moran_monte_carlo(
     """
     Run Moran process via Monte Carlo simulation.
     Returns estimated stationary abundance for each type.
-    
-    Much faster than computing exact transition matrix for large state spaces.
     """
     if rng is None:
         rng = np.random.default_rng()
     
     n_types = payoff_matrix.shape[0]
     
-    # Initialize population: uniform distribution
-    population = np.zeros(N, dtype=int)
+    # Initialize population (uniform)
+    population = np.zeros(n_types, dtype=int)
     for i in range(N):
-        population[i] = i % n_types
-    rng.shuffle(population)
+        population[i % n_types] += 1
     
-    # Track abundances after burn-in
-    abundance_sum = np.zeros(n_types)
-    n_samples = 0
+    abundance_samples = []
     
     for gen in range(n_generations):
-        # Count types
-        counts = np.bincount(population, minlength=n_types)
+        # Compute fitness for each type
+        type_counts = population
+        total_pop = N
         
-        # Compute fitness for each individual
-        fitness = np.zeros(N)
-        for idx in range(N):
-            my_type = population[idx]
-            # Average payoff against population
-            for other_type in range(n_types):
-                fitness[idx] += (counts[other_type] / N) * payoff_matrix[my_type, other_type]
+        # Average payoff for each type
+        fitness = np.zeros(n_types)
+        for i in range(n_types):
+            if type_counts[i] > 0:
+                for j in range(n_types):
+                    fitness[i] += payoff_matrix[i, j] * type_counts[j] / total_pop
         
-        # Selection: softmax probabilities
-        exp_fit = np.exp(selection_strength * (fitness - fitness.max()))
-        select_probs = exp_fit / exp_fit.sum()
+        # Selection probabilities (exponential fitness)
+        selection_probs = np.zeros(n_types)
+        for i in range(n_types):
+            selection_probs[i] = type_counts[i] * np.exp(selection_strength * fitness[i])
         
-        # Choose reproducer
-        reproducer_idx = rng.choice(N, p=select_probs)
-        reproducer_type = population[reproducer_idx]
-        
-        # Choose who dies (uniform)
-        dying_idx = rng.integers(0, N)
-        
-        # Mutation
-        if rng.random() < mutation_rate:
-            offspring_type = rng.integers(0, n_types)
+        if selection_probs.sum() > 0:
+            selection_probs /= selection_probs.sum()
         else:
-            offspring_type = reproducer_type
+            selection_probs = type_counts / total_pop
+        
+        # Death probabilities (uniform)
+        death_probs = type_counts / total_pop
+        
+        # Select reproducer
+        if rng.random() < mutation_rate:
+            # Mutation: random type
+            reproducer = rng.integers(0, n_types)
+        else:
+            reproducer = rng.choice(n_types, p=selection_probs)
+        
+        # Select individual to die
+        dying = rng.choice(n_types, p=death_probs)
         
         # Update population
-        population[dying_idx] = offspring_type
+        if population[dying] > 0:
+            population[dying] -= 1
+            population[reproducer] += 1
         
         # Record abundance after burn-in
         if gen >= burn_in:
-            counts = np.bincount(population, minlength=n_types)
-            abundance_sum += counts / N
-            n_samples += 1
+            abundance_samples.append(population.copy() / N)
     
-    return abundance_sum / n_samples
+    # Return mean abundance
+    return np.mean(abundance_samples, axis=0)
 
 
 # =============================================================================
-# Main Simulation
+# Figure 3C Configuration and Simulation
 # =============================================================================
 
 @dataclass
-class Figure3BConfig:
+class Figure3CConfig:
     N: int = 10
+    T: int = 20  # Fixed game length
     selection_strength: float = 2.0
     mutation_rate: float = 0.001
     omega: float = 0.5
-    epsilon_a: float = 0.05
-    n_samples: int = 20        # Samples per payoff entry
-    n_generations: int = 5000  # MC generations
-    burn_in: int = 1000
-    T_values: List[int] = None
+    n_samples: int = 50
+    n_generations: int = 10000
+    burn_in: int = 3000
+    epsilon_values: List[float] = None  # Action error values to sweep
     seed: int = 42
 
 
-def run_figure_3b_simulations(config: Figure3BConfig = None, verbose=True) -> Dict:
-    """Run Figure 3B: TGMI abundance vs game length T."""
+def run_figure_3c_simulations(config: Figure3CConfig = None, verbose=True) -> Dict:
+    """Run Figure 3C: TGMI abundance vs action error ε_a."""
     if config is None:
-        config = Figure3BConfig()
+        config = Figure3CConfig()
     
-    if config.T_values is None:
-        config.T_values = [1, 2, 5, 10, 20, 50, 100]
+    if config.epsilon_values is None:
+        config.epsilon_values = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
     
     strategy_types = STRATEGY_TYPES
     tgmi_idx = strategy_types.index('TGMI')
     
-    # Pre-sample games ONCE for all T values (ensures consistency)
+    # Pre-sample games ONCE for all ε_a values (ensures consistency)
     master_rng = np.random.default_rng(config.seed)
     mgg = MoralGameGenerator(num_actions=11, rng=master_rng)
     games = [mgg.sample_game() for _ in range(config.n_samples)]
     
     if verbose:
         print(f"Pre-sampled {len(games)} games for consistent payoff estimation")
+        print(f"Fixed game length T = {config.T}")
     
     abundances = []
     all_abundances = []
     
-    for T in config.T_values:
+    for eps_a in config.epsilon_values:
         if verbose:
-            print(f"T={T}: Computing payoff matrix...")
+            print(f"ε_a={eps_a:.2f}: Computing payoff matrix...")
         
-        # Use fresh RNG for each T, but same games
-        rng = np.random.default_rng(config.seed + T)
+        # Use fresh RNG for each ε_a
+        rng = np.random.default_rng(config.seed + int(eps_a * 1000))
         
-        # Compute payoff matrix using pre-sampled games
+        # Compute payoff matrix with this action error
         payoff_matrix = compute_payoff_matrix(
-            strategy_types, mgg, T,
+            strategy_types, mgg, config.T,
             omega=config.omega,
             n_samples=config.n_samples,
-            epsilon=config.epsilon_a,
+            epsilon=eps_a,  # This is the sweep variable!
             rng=rng,
-            games=games,  # Use same games for all T
+            games=games,
         )
         
         if verbose:
             print(f"  Payoff matrix:\n{np.round(payoff_matrix, 3)}")
         
-        # Run MULTIPLE Monte Carlo Moran processes and average
-        n_mc_runs = 20  # Average over 20 independent runs for smoother results
+        # Run multiple Monte Carlo Moran processes and average
+        n_mc_runs = 20
         abundance_runs = []
         
         for mc_run in range(n_mc_runs):
-            mc_rng = np.random.default_rng(config.seed + T * 1000 + mc_run * 100)
+            mc_rng = np.random.default_rng(config.seed + int(eps_a * 1000) + mc_run * 100)
             abundance = run_moran_monte_carlo(
                 payoff_matrix,
                 N=config.N,
@@ -420,7 +430,7 @@ def run_figure_3b_simulations(config: Figure3BConfig = None, verbose=True) -> Di
             print(f"  TGMI abundance: {mean_abundance[tgmi_idx]:.4f}")
     
     return {
-        'T_values': np.array(config.T_values),
+        'epsilon_values': np.array(config.epsilon_values),
         'abundances': np.array(abundances),
         'all_abundances': np.array(all_abundances),
         'strategy_types': strategy_types,
@@ -432,23 +442,21 @@ def run_figure_3b_simulations(config: Figure3BConfig = None, verbose=True) -> Di
 # Plotting
 # =============================================================================
 
-def plot_figure_3b(results: Dict, save_path: Optional[str] = None) -> plt.Figure:
-    """Plot Figure 3B."""
-    plt.style.use('seaborn-v0_8-whitegrid')
+def plot_figure_3c(results: Dict, save_path: str = None):
+    """Plot Figure 3C: TGMI abundance vs action error."""
     plt.rcParams.update({
-        'font.family': 'sans-serif',
         'font.size': 12,
         'axes.labelsize': 14,
     })
     
-    T_values = results['T_values']
+    epsilon_values = results['epsilon_values']
     abundances = results['abundances']
     n_types = len(results['strategy_types'])
     
     fig, ax = plt.subplots(figsize=(8, 6))
     
     # Plot TGMI abundance
-    ax.plot(T_values, abundances, 'o-',
+    ax.plot(epsilon_values, abundances, 'o-',
             color='#2E86AB', linewidth=2.5, markersize=10,
             markerfacecolor='white', markeredgewidth=2.5,
             label='TGMI')
@@ -459,15 +467,14 @@ def plot_figure_3b(results: Dict, save_path: Optional[str] = None) -> plt.Figure
     ax.axhline(y=0.5, color='red', linestyle=':',
                linewidth=1.5, alpha=0.7, label='Majority')
     
-    ax.set_xlabel('Game length $T$')
+    ax.set_xlabel(r'Action error $\varepsilon_a$')
     ax.set_ylabel('Steady-state TGMI abundance')
-    ax.set_title('B', fontweight='bold', loc='left', fontsize=16)
+    ax.set_title('C', fontweight='bold', loc='left', fontsize=16)
     
-    ax.set_xscale('log')
-    ax.set_xlim(0.8, 150)
+    ax.set_xlim(-0.02, 0.45)
     ax.set_ylim(0, 0.8)
     
-    ax.legend(loc='upper left', framealpha=0.95)
+    ax.legend(loc='upper right', framealpha=0.95)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     
@@ -485,39 +492,46 @@ def plot_figure_3b(results: Dict, save_path: Optional[str] = None) -> plt.Figure
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Running Figure 3B simulations...")
-    print("=" * 50)
+    print("Running Figure 3C simulations...")
+    print("=" * 60)
+    print("Testing TGMI robustness to action noise")
     print("Strategy types:", STRATEGY_TYPES)
-    print("=" * 50)
+    print("=" * 60)
     
-    config = Figure3BConfig(
+    config = Figure3CConfig(
         N=10,
+        T=20,  # Fixed game length
         selection_strength=2.0,
         mutation_rate=0.001,
         omega=0.5,
-        epsilon_a=0.05,
-        n_samples=50,           # More samples for stable payoff estimation
-        n_generations=10000,    # Longer MC runs
-        burn_in=3000,
-        T_values=[1, 2, 5, 10, 20, 50, 100],
+        n_samples=100,
+        n_generations=20000,
+        burn_in=5000,
+        epsilon_values=[0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4],
         seed=42,
     )
     
-    results = run_figure_3b_simulations(config, verbose=True)
+    results = run_figure_3c_simulations(config, verbose=True)
     
-    print("\n" + "=" * 50)
-    print("RESULTS: TGMI Abundance vs Game Length T")
-    print("=" * 50)
-    for T, ab in zip(results['T_values'], results['abundances']):
-        marker = "✓ MAJORITY" if ab > 0.5 else ""
-        print(f"  T={T:3d}: {ab:.4f} {marker}")
+    print("\n" + "=" * 60)
+    print("RESULTS: TGMI Abundance vs Action Error ε_a")
+    print("=" * 60)
+    for eps, ab in zip(results['epsilon_values'], results['abundances']):
+        marker = "✓ ROBUST" if ab > 0.5 else ("~" if ab > 0.25 else "✗")
+        print(f"  ε_a={eps:.2f}: {ab:.4f} {marker}")
+    
+    # Robustness analysis
+    low_noise_avg = np.mean(results['abundances'][:3])  # ε_a ≤ 0.1
+    high_noise_avg = np.mean(results['abundances'][-2:])  # ε_a ≥ 0.3
+    print(f"\nLow noise avg (ε_a ≤ 0.1): {low_noise_avg:.4f}")
+    print(f"High noise avg (ε_a ≥ 0.3): {high_noise_avg:.4f}")
     
     # Save plot
     output_dir = os.path.join(_parent_dir, 'outputs', 'plots')
     os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, 'figure_3b.png')
+    save_path = os.path.join(output_dir, 'figure_3c.png')
     
-    fig = plot_figure_3b(results, save_path=save_path)
+    fig = plot_figure_3c(results, save_path=save_path)
     plt.show()
     
     print("\nDone!")
